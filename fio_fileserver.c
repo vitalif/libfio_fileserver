@@ -4,36 +4,33 @@
 // USAGE: fio -name=test -ioengine=./libfio_fileserver.so -chunk_size=256K \
 //   -directory=/home/bench -size=10G [-direct=1] [-fsync_on_close=1] [-sync=1] [-dir_levels=2] [-subdirs_per_dir=64]
 
-#ifndef _LARGEFILE64_SOURCE
 #define _LARGEFILE64_SOURCE
-#endif
+#define _GNU_SOURCE
 
+#include <stdlib.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <unistd.h>
 
-#include <string>
-
-extern "C" {
 #define CONFIG_HAVE_GETTID
+#define CONFIG_SYNC_FILE_RANGE
 #define CONFIG_PWRITEV2
 #include "fio/fio.h"
 #include "fio/optgroup.h"
-}
 
 struct sec_data
 {
-    int __pad;
+    int __pad[2];
 };
 
 struct sec_options
 {
     int __pad;
     int __pad2;
-    int dir_levels = 2;
-    int subdirs_per_dir = 64;
-    int chunk_size = 262144;
+    int dir_levels;
+    int subdirs_per_dir;
+    int chunk_size;
 };
 
 static struct fio_option options[] = {
@@ -72,11 +69,19 @@ static struct fio_option options[] = {
     },
 };
 
-static int sec_setup(struct thread_data *td)
+static int sec_init(struct thread_data *td)
 {
-    sec_data *bsd;
+    struct sec_data *bsd;
 
-    bsd = new sec_data;
+    struct sec_options *opt = (struct sec_options*)td->eo;
+    if (!td->o.directory || opt->chunk_size <= 0 || opt->dir_levels > 0 && opt->subdirs_per_dir <= 0)
+    {
+        fprintf(stderr, "USAGE: fio -name=test -ioengine=./libfio_fileserver.so"
+            " -chunk_size=256K -directory=/home/bench -size=10G [-direct=1] [-fsync_on_close=1] [-sync=1] [-dir_levels=2] [-subdirs_per_dir=64]\n");
+        exit(1);
+    }
+
+    bsd = malloc(sizeof(struct sec_data));
     if (!bsd)
     {
         td_verror(td, errno, "calloc");
@@ -96,80 +101,74 @@ static int sec_setup(struct thread_data *td)
 
 static void sec_cleanup(struct thread_data *td)
 {
-    sec_data *bsd = (sec_data*)td->io_ops_data;
+    struct sec_data *bsd = (struct sec_data*)td->io_ops_data;
     if (bsd)
     {
-        delete bsd;
+        free(bsd);
     }
-}
-
-static int sec_init(struct thread_data *td)
-{
-    sec_options *opt = (sec_options*)td->eo;
-    if (!td->o.directory || opt->chunk_size <= 0 || opt->dir_levels > 0 && opt->subdirs_per_dir <= 0)
-    {
-        fprintf(stderr, "USAGE: fio -name=test -ioengine=./libfio_fileserver.so"
-            " -chunk_size=256K -directory=/home/bench -size=10G [-direct=1] [-fsync_on_close=1] [-sync=1] [-dir_levels=2] [-subdirs_per_dir=64]\n");
-        exit(1);
-    }
-    return 0;
 }
 
 /* Begin read or write request. */
 static enum fio_q_status sec_queue(struct thread_data *td, struct io_u *io)
 {
-    sec_options *opt = (sec_options*)td->eo;
-    sec_data *bsd = (sec_data*)td->io_ops_data;
-    int r;
+    struct sec_options *opt = (struct sec_options*)td->eo;
+    struct sec_data *bsd = (struct sec_data*)td->io_ops_data;
+    int i, r, pos;
+    int dirname_len, filename_buf;
+    char *file_name;
+    struct stat statbuf;
+    uint64_t file_idx;
 
     fio_ro_check(td, io);
 
     io->engine_data = bsd;
 
-    uint64_t file_num = io->offset / opt->chunk_size;
-    struct stat statbuf;
-    std::string file_name(td->o.directory);
-    char buf[128];
-    uint64_t file_idx = file_num;
-    for (int i = 0; i < opt->dir_levels; i++)
+    file_idx = io->offset / opt->chunk_size;
+    dirname_len = strlen(td->o.directory);
+    filename_buf = dirname_len + opt->subdirs_per_dir * 3 + 256;
+    file_name = malloc(filename_buf);
+    if (!file_name)
+        exit(1);
+    strncpy(file_name, td->o.directory, filename_buf);
+    pos = dirname_len;
+    for (i = 0; i < opt->dir_levels; i++)
     {
         int subdir = file_idx % opt->subdirs_per_dir;
         file_idx /= opt->subdirs_per_dir;
-        snprintf(buf, sizeof(buf), "%02x", subdir);
-        file_name += "/"+std::string(buf);
-        r = stat(file_name.c_str(), &statbuf);
+        pos += snprintf(file_name + pos, filename_buf - pos - 1, "/%02x", subdir);
+        r = stat(file_name, &statbuf);
         if (r < 0)
         {
             if (errno == ENOENT)
             {
                 if (io->ddir == DDIR_WRITE)
                 {
-                    r = mkdir(file_name.c_str(), 0777);
+                    r = mkdir(file_name, 0777);
                     if (r < 0 && errno != EEXIST)
                     {
-                        fprintf(stderr, "Error mkdir(%s): %d (%s)\n", file_name.c_str(), errno, strerror(errno));
+                        fprintf(stderr, "Error mkdir(%s): %d (%s)\n", file_name, errno, strerror(errno));
                         exit(1);
                     }
                 }
             }
             else
             {
-                fprintf(stderr, "Error stat(%s): %d (%s)\n", file_name.c_str(), errno, strerror(errno));
+                fprintf(stderr, "Error stat(%s): %d (%s)\n", file_name, errno, strerror(errno));
                 exit(1);
             }
         }
     }
-    snprintf(buf, sizeof(buf), "%02lx", file_idx);
-    file_name += "/"+std::string(buf);
+    pos += snprintf(file_name + pos, filename_buf - pos - 1, "/%02lx", file_idx);
+    file_name[pos] = 0;
 
-    int fd = open(file_name.c_str(),
+    int fd = open(file_name,
         (io->ddir == DDIR_WRITE ? (O_CREAT|O_RDWR) : O_RDONLY)
         | (td->o.sync_io ? O_SYNC : 0)
         | (td->o.odirect ? O_DIRECT : 0)
     );
     if (fd < 0 && errno != ENOENT)
     {
-        fprintf(stderr, "Error open(%s): %d (%s)\n", file_name.c_str(), errno, strerror(errno));
+        fprintf(stderr, "Error open(%s): %d (%s)\n", file_name, errno, strerror(errno));
         exit(1);
     }
     if (io->ddir == DDIR_READ)
@@ -201,6 +200,7 @@ static enum fio_q_status sec_queue(struct thread_data *td, struct io_u *io)
         io->error = EINVAL;
     }
     close(fd);
+    free(file_name);
     return FIO_Q_COMPLETED;
 }
 
@@ -238,7 +238,6 @@ struct ioengine_ops ioengine = {
     .name               = "fileserver",
     .version            = FIO_IOOPS_VERSION,
     .flags              = FIO_MEMALIGN | FIO_DISKLESSIO | FIO_NOEXTEND,
-    .setup              = sec_setup,
     .init               = sec_init,
     .queue              = sec_queue,
     .getevents          = sec_getevents,
