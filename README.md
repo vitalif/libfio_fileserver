@@ -10,6 +10,10 @@ the file server access pattern where a number of files is sharded over several l
 * Install g++
 * Run `make`
 
+# Compatibility
+
+fio 3.15 or later.
+
 # Usage
 
 ```
@@ -27,7 +31,7 @@ Notes:
 * I/O is done using synchronous syscalls, thus iodepth is not supported
 
 Because of the synchronous syscalls it's slightly tricky to use parallelism correctly.
-So, for example, to fill the directory with 262144 4k files, run:
+So, for example, to fill a directory with 262144 4k files, run:
 
 ```
 fio -thread -name=test -direct=1 -ioengine=./libfio_fileserver.so -fsync_on_close=1 \
