@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define CONFIG_HAVE_GETTID
 #define CONFIG_SYNC_FILE_RANGE
@@ -19,9 +20,27 @@
 #include "fio/fio.h"
 #include "fio/optgroup.h"
 
+struct sec_options;
+
 struct sec_data
 {
     int __pad[2];
+    struct thread_data *td;
+    struct sec_options *opt;
+
+    pthread_mutex_t mutex;
+    pthread_cond_t cond, cond_done;
+    int finished;
+    int in_flight;
+
+    pthread_t *threads;
+    int thread_count, thread_alloc;
+
+    struct io_u **requests;
+    int request_count, request_alloc;
+
+    struct io_u **done;
+    int done_count, done_alloc;
 };
 
 struct sec_options
@@ -81,19 +100,39 @@ static int sec_init(struct thread_data *td)
         exit(1);
     }
 
-    bsd = malloc(sizeof(struct sec_data));
+    bsd = calloc(1, sizeof(struct sec_data));
     if (!bsd)
     {
         td_verror(td, errno, "calloc");
         return 1;
     }
     td->io_ops_data = bsd;
+    bsd->td = td;
+    bsd->opt = opt;
 
     if (!td->files_index)
     {
         add_file(td, "fileserver", 0, 0);
         td->o.nr_files = td->o.nr_files ? : 1;
         td->o.open_files++;
+    }
+
+    if (pthread_mutex_init(&bsd->mutex, NULL) != 0)
+    {
+        td_verror(td, errno, "pthread_mutex_init");
+        return 1;
+    }
+
+    if (pthread_cond_init(&bsd->cond, NULL) != 0)
+    {
+        td_verror(td, errno, "pthread_cond_init");
+        return 1;
+    }
+
+    if (pthread_cond_init(&bsd->cond_done, NULL) != 0)
+    {
+        td_verror(td, errno, "pthread_cond_init");
+        return 1;
     }
 
     return 0;
@@ -104,22 +143,38 @@ static void sec_cleanup(struct thread_data *td)
     struct sec_data *bsd = (struct sec_data*)td->io_ops_data;
     if (bsd)
     {
+        int i;
+        void *retval = NULL;
+        pthread_mutex_lock(&bsd->mutex);
+        bsd->finished = 1;
+        pthread_cond_broadcast(&bsd->cond);
+        pthread_cond_broadcast(&bsd->cond_done);
+        pthread_mutex_unlock(&bsd->mutex);
+        for (i = 0; i < bsd->thread_count; i++)
+        {
+            if (pthread_join(bsd->threads[i], &retval) != 0)
+            {
+                td_verror(td, errno, "pthread_join");
+                exit(1);
+            }
+        }
+        pthread_cond_destroy(&bsd->cond);
+        pthread_cond_destroy(&bsd->cond_done);
+        pthread_mutex_destroy(&bsd->mutex);
         free(bsd);
     }
 }
 
 /* Begin read or write request. */
-static enum fio_q_status sec_queue(struct thread_data *td, struct io_u *io)
+static void sec_exec(struct sec_data *bsd, struct io_u *io)
 {
-    struct sec_options *opt = (struct sec_options*)td->eo;
-    struct sec_data *bsd = (struct sec_data*)td->io_ops_data;
+    struct thread_data *td = bsd->td;
+    struct sec_options *opt = bsd->opt;
     int i, r, pos;
     int dirname_len, filename_buf;
     char *file_name;
     struct stat statbuf;
     uint64_t file_idx;
-
-    fio_ro_check(td, io);
 
     io->engine_data = bsd;
 
@@ -164,7 +219,8 @@ static enum fio_q_status sec_queue(struct thread_data *td, struct io_u *io)
     int fd = open(file_name,
         (io->ddir == DDIR_WRITE ? (O_CREAT|O_RDWR) : O_RDONLY)
         | (td->o.sync_io ? O_SYNC : 0)
-        | (td->o.odirect ? O_DIRECT : 0)
+        | (td->o.odirect ? O_DIRECT : 0),
+        0644
     );
     if (fd < 0 && errno != ENOENT)
     {
@@ -201,17 +257,110 @@ static enum fio_q_status sec_queue(struct thread_data *td, struct io_u *io)
     }
     close(fd);
     free(file_name);
-    return FIO_Q_COMPLETED;
+}
+
+static void* sec_thread(void *opaque)
+{
+    struct sec_data *bsd = (struct sec_data*)opaque;
+    struct io_u* req = NULL;
+    while (1)
+    {
+        // Get request
+        pthread_mutex_lock(&bsd->mutex);
+        while (bsd->request_count <= 0 && !bsd->finished)
+        {
+            pthread_cond_wait(&bsd->cond, &bsd->mutex);
+        }
+        if (bsd->finished)
+        {
+            pthread_mutex_unlock(&bsd->mutex);
+            break;
+        }
+        req = bsd->requests[--bsd->request_count];
+        pthread_mutex_unlock(&bsd->mutex);
+        // Execute
+        sec_exec(bsd, req);
+        // Put response
+        pthread_mutex_lock(&bsd->mutex);
+        if (bsd->done_count >= bsd->done_alloc)
+        {
+            bsd->done_alloc += 16;
+            bsd->done = realloc(bsd->done, bsd->done_alloc*sizeof(struct io_u*));
+        }
+        bsd->done[bsd->done_count++] = req;
+        if (bsd->done_count == 1)
+        {
+            pthread_cond_signal(&bsd->cond_done);
+        }
+        pthread_mutex_unlock(&bsd->mutex);
+    }
+    return NULL;
+}
+
+/* Begin read or write request. */
+static enum fio_q_status sec_queue(struct thread_data *td, struct io_u *io)
+{
+    struct sec_data *bsd = (struct sec_data*)td->io_ops_data;
+
+    fio_ro_check(td, io);
+
+    pthread_mutex_lock(&bsd->mutex);
+    if (bsd->request_count >= bsd->request_alloc)
+    {
+        bsd->request_alloc += 16;
+        bsd->requests = realloc(bsd->requests, bsd->request_alloc*sizeof(struct io_u*));
+    }
+    bsd->requests[bsd->request_count++] = io;
+    if (bsd->request_count == 1)
+    {
+        pthread_cond_signal(&bsd->cond);
+    }
+    pthread_mutex_unlock(&bsd->mutex);
+
+    bsd->in_flight++;
+    while (bsd->in_flight > bsd->thread_count)
+    {
+        if (bsd->thread_count >= bsd->thread_alloc)
+        {
+            bsd->thread_alloc += 16;
+            bsd->threads = realloc(bsd->threads, bsd->thread_alloc*sizeof(pthread_t));
+        }
+        if (pthread_create(&bsd->threads[bsd->thread_count++], NULL, sec_thread, bsd) != 0)
+        {
+            td_verror(td, errno, "pthread_create");
+            exit(1);
+        }
+    }
+
+    return FIO_Q_QUEUED;
 }
 
 static int sec_getevents(struct thread_data *td, unsigned int min, unsigned int max, const struct timespec *t)
 {
-    return 0;
+    struct sec_data *bsd = (struct sec_data*)td->io_ops_data;
+    int done_count = 0;
+    pthread_mutex_lock(&bsd->mutex);
+    while (bsd->done_count <= 0)
+    {
+        pthread_cond_wait(&bsd->cond_done, &bsd->mutex);
+    }
+    done_count = bsd->done_count;
+    pthread_mutex_unlock(&bsd->mutex);
+    return done_count;
 }
 
 static struct io_u *sec_event(struct thread_data *td, int event)
 {
-    return NULL;
+    struct sec_data *bsd = (struct sec_data*)td->io_ops_data;
+    struct io_u *req = NULL;
+    pthread_mutex_lock(&bsd->mutex);
+    if (bsd->done_count > 0)
+    {
+        req = bsd->done[--bsd->done_count];
+    }
+    bsd->in_flight--;
+    pthread_mutex_unlock(&bsd->mutex);
+    return req;
 }
 
 static int sec_io_u_init(struct thread_data *td, struct io_u *io)

@@ -19,7 +19,7 @@ fio 3.15 or later.
 ```
 fio -name=test -ioengine=./libfio_fileserver.so -directory=/home/bench \
     -chunk_size=256k -size=10G -direct=1 [-dir_levels=2] [-subdirs_per_dir=64] \
-    -bs=256k -rw=randwrite [-fsync_on_close=1] [-sync=1] [-numjobs=16 -group_reporting]
+    -bs=256k -rw=randwrite [-fsync_on_close=1] [-sync=1] [-iodepth=16]
 ```
 
 Notes:
@@ -28,18 +28,17 @@ Notes:
 * `fsync=N` is supported, but it only fsyncs a random file
 * reads return error when encountering a non-existing file
 * You can also use various distribution parameters (zipf, etc)
-* I/O is done using synchronous syscalls, thus iodepth is not supported
+* I/O is done using synchronous syscalls, but iodepth can be used normally
+  because it's supported using a thread pool
 
-Because of the synchronous syscalls it's slightly tricky to use parallelism correctly.
-So, for example, to fill a directory with 262144 4k files, run:
+For example, to fill a directory with 262144 4k files using 128 threads, run:
 
 ```
 fio -thread -name=test -direct=1 -ioengine=./libfio_fileserver.so -fsync_on_close=1 \
-    -directory=/home/bench -chunk_size=4k -size=1G -bs=4k -rw=write:508k \
-    -numjobs=128 -offset_increment=4k -group_reporting
+    -directory=/home/bench -chunk_size=4k -size=1G -bs=4k -rw=write -iodepth=128
 ```
 
 # License & Author
 
-* Author: Vitaliy Filippov vitalif[at]yourcmc.ru, 2020
+* Author: Vitaliy Filippov vitalif[at]yourcmc.ru, 2020-2021
 * License: GNU GPL v2.0 or later version
